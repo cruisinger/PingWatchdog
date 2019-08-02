@@ -1,0 +1,407 @@
+#include <ESP8266WiFi.h>
+#include <WiFiClient.h>
+#include <ESP8266WebServer.h>
+#include <EEPROM.h>
+extern "C" {
+#include "user_interface.h"
+#include "ping.h"
+}
+ 
+ESP8266WebServer server(80);
+ 
+/*
+ * To set the new Wifi, enter credentials in the two variables and set RESET_EEPROM to true.
+ * During the next start it will save it into the EEPROM.
+ * Then set RESET_EEPROM to false and flash it again.
+ * When wifi changes, remember to first change the name over the webinterface.
+*/
+ 
+#define RESET_EEPROM false
+#define WIFI_SSID "YOUR_SSID"
+#define WIFI_PASSWORD "YOUR_WLAN_PASSWORD"
+ 
+// Settings
+const int PING_INTERVAL = 5000;
+const int PIN_LED = 2;
+const int count_hosts = 3;
+int connection_try = 15;
+char host1[15];
+char host2[15];
+char host3[15];
+boolean host_is_online[] = {false, false, false};
+ 
+// EEPROM Addresses
+const int ADDRESS_IP1 = 0;
+const int ADDRESS_IP2 = 15;
+const int ADDRESS_IP3 = 30;
+const int ADDRESS_INIT = 105; // - 99
+const int ADDRESS_PASSWORD = 45; // - 75
+const int ADDRESS_SSID = 75; // - 105
+const int EEPROM_SIZE = 106;
+ 
+// Variables
+IPAddress network_ip;
+char network_ssid[30];
+char network_password[30];
+struct ping_option pingopt;
+unsigned long last_ping = 0;
+unsigned long last_seen_online = 0;
+unsigned long currentMillis = 0;
+int currentHost = 0;
+int state_LED = LOW;
+boolean got_new_hosts;
+boolean save_wifi;
+ 
+// Save current config
+void writeIPtoEEPROM() {
+  for (int i = 0; i < 15; i++) {
+    EEPROM.write(ADDRESS_IP1 + i, host1[i]);
+    EEPROM.write(ADDRESS_IP2 + i, host2[i]);
+    EEPROM.write(ADDRESS_IP3 + i, host3[i]);
+  }
+  EEPROM.commit();
+}
+ 
+void writeSSIDtoEEPROM(String new_ssid) {
+  for (int i = 0; i < 30; i++) {
+    if (i < new_ssid.length())
+      EEPROM.write(ADDRESS_SSID + i, new_ssid[i]);
+    else
+      EEPROM.write(ADDRESS_SSID + i, '\0');
+  }
+  EEPROM.commit();
+}
+ 
+void writePASSWORDtoEEPROM(String new_password) {
+  for (int i = 0; i < 30; i++) {
+    if (i < new_password.length())
+      EEPROM.write(ADDRESS_PASSWORD + i, new_password[i]);
+    else
+      EEPROM.write(ADDRESS_PASSWORD + i, '\0');
+  }
+  EEPROM.commit();
+}
+ 
+// Reply is called, when response arrives
+static void callback_reply (void* arg, void *pdata) {
+  struct ping_resp *pingresp = (struct ping_resp *)pdata;
+  if (pingresp->resp_time > 0) {
+    Serial.println(" Response");
+    last_seen_online = currentMillis;
+    host_is_online[currentHost] = true;
+  }
+  else {
+    Serial.println(" Timeout");
+    host_is_online[currentHost] = false;
+  }
+}
+ 
+// Sends an echo request to an IP-Address
+void ping(uint32 ip)
+{
+  pingopt.ip = ip;
+  pingopt.count = 1;
+  pingopt.coarse_time = 200;
+  pingopt.recv_function = &callback_reply;
+  // pingopt.sent_function = NULL;
+  ping_start(&pingopt);
+}
+ 
+ 
+boolean checkIPsyntax(String ip) {
+  // Only 0-9 and dots
+  for (int i = 0; i <= 33; i++)
+    if (ip.indexOf(i) != -1)
+      return false;
+  if (ip.indexOf(0x2F) != -1)
+    return false;
+  for (int i = 0x3A; i <= 0x7F; i++)
+    if (ip.indexOf(i) != -1)
+      return false;
+ 
+  // Count the amount of dots
+  int dots = 0;
+  for (int i = 0; i < ip.length(); i++)
+    if (ip[i] == '.')
+      dots++;
+  if (dots != 3)
+    return false;
+ 
+  // Check the range of the oktets
+  int dot_1 = ip.indexOf('.');
+  int dot_2 = ip.indexOf('.', dot_1 + 1);
+  int dot_3 = ip.indexOf('.', dot_2 + 1);
+  int oktet_1 = ip.substring(0, dot_1).toInt();
+  int oktet_2 = ip.substring(dot_1 + 1, dot_2).toInt();
+  int oktet_3 = ip.substring(dot_2 + 1, dot_3).toInt();
+  int oktet_4 = ip.substring(dot_3 + 1).toInt();
+  if (oktet_1 >=  0 && oktet_1 <= 255 &&
+      oktet_2 >= 0 && oktet_2 <= 255 &&
+      oktet_3 >= 0 && oktet_3 <= 255 &&
+      oktet_4 >= 0 && oktet_4 <= 255 )
+    return true;
+  else
+    return false;
+}
+ 
+ 
+void handleRoot() {
+  Serial.print(currentMillis);
+  Serial.print(": HTTP-Request with ");
+  got_new_hosts = false;
+  save_wifi = false;
+  String temp_ssid;
+  String temp_password;
+ 
+  if (server.args() > 0) {
+    Serial.print(server.args());
+    Serial.print(" args: ");
+    for (int a = 0; a < server.args(); a++) {
+      Serial.print("[");
+      Serial.print(server.argName(a));
+      Serial.print("=");
+      Serial.print(server.arg(a));
+      Serial.print("]");
+ 
+      if (server.arg(a) == "Restart")  // Restart ESP8266
+        system_restart();
+      else if (server.arg(a) == "Save-Wifi") {
+        Serial.println("OK, Save-Wifi");
+        save_wifi = true;
+      } else if (server.argName(a) == "ssid") {
+        for (int i = 0; i < 30; i++) {
+          if (i < server.arg(a).length())
+            network_ssid[i] = server.arg(a)[i];
+          else
+            network_ssid[i] = '\0';
+        }
+      } else if (server.argName(a) == "password") {
+        for (int i = 0; i < 30; i++) {
+          if (i < server.arg(a).length())
+            network_password[i] = server.arg(a)[i];
+          else
+            network_password[i] = '\0';
+        }
+      } else if (server.argName(a) == "ip1" && checkIPsyntax(server.arg(a))) {
+        memset(host1, 0, sizeof(host1));
+        for (int i = 0; i < server.arg(a).length(); i++)
+          host1[i] = server.arg(a)[i];
+        got_new_hosts = true;
+        Serial.print(" OK1 ");
+      } else if (server.argName(a) == "ip2" && checkIPsyntax(server.arg(a))) {
+        memset(host2, 0, sizeof(host2));
+        for (int i = 0; i < server.arg(a).length(); i++)
+          host2[i] = server.arg(a)[i];
+        got_new_hosts = true;
+        Serial.print(" OK2 ");
+      } else if (server.argName(a) == "ip3" && checkIPsyntax(server.arg(a))) {
+        memset(host3, 0, sizeof(host3));
+        for (int i = 0; i < server.arg(a).length(); i++)
+          host3[i] = server.arg(a)[i];
+        got_new_hosts = true;
+        Serial.print(" OK3 ");
+      } else
+        Serial.print(" NACK; ");
+    }
+  } else Serial.print("no args");
+  Serial.println(".");
+ 
+  // Save it
+  if (got_new_hosts)
+    writeIPtoEEPROM();
+ 
+  if (save_wifi) {
+    writeSSIDtoEEPROM(network_ssid);
+    if (temp_password != "notchanged")
+      writePASSWORDtoEEPROM(network_password);
+  }
+ 
+  // Print the HTML-Page
+  String result = "<html><head><title>PingCheck</title></head>\r\n<body>\r\n";
+  result += "PingCheck 2.0 (2015 Marcel Imig <a href=\"http://www.frag-duino.de\">www.frag-duino.de</a>)<br><br>\r\n\r\n";
+  result += "<fieldset name=\"wifistatus\"><legend>Wifi status</legend><form action=\"\" method=\"post\">";
+ 
+  result += "<table>\r\n";
+ 
+  result += "<tr><td><b>Network SSID:</b></td>\r\n";
+  result += "<td><input type=\"text\" name=\"ssid\" value=\"";
+  result += network_ssid;
+  result += "\" maxlength=\"30\"></td>\r\n</tr>\r\n";
+  result += "<tr><td><b>Network Password:</b></td>\r\n";
+  result += "<td><input type=\"password\" name=\"password\" value=\"notchanged\" maxlength=\"30\"></td>\r\n</tr>\r\n";
+  result += "</td>\r\n</tr>\r\n</table>\r\n";
+ 
+  result += "<input type=\"Submit\" name=\"send\" value=\"Save-Wifi\" >\r\n";
+  result += "<input type=\"Submit\" name=\"send\" value=\"Restart\" ></form></fieldset>\r\n\r\n<br>\r\n<br>\r\n";
+ 
+  result += "<fieldset name=\"hosts\"><legend>Hosts</legend>\r\n<b>Monitoring IPs:</b><br><br>\r\n\r\n";
+  result += "<form action=\"\" method=\"post\">";
+  result += "IP1: <input type=\"text\" name=\"ip1\" value=\"";
+  result += host1;
+  result += "\" ";
+  if (host_is_online[0])
+    result += "style=\"background-color:green\"";
+  else
+    result += "style=\"background-color:red\"";
+  result += " maxlength=\"15\"><br>\r\n";
+ 
+  result += "IP2: <input type=\"text\" name=\"ip2\" value=\"";
+  result += host2;
+  result += "\" ";
+  if (host_is_online[1])
+    result += "style=\"background-color:green\"";
+  else
+    result += "style=\"background-color:red\"";
+  result += " maxlength=\"15\"><br>\r\n";
+ 
+  result += "IP3: <input type=\"text\" name=\"ip3\" value=\"";
+  result += host3;
+  result += "\" ";
+  if (host_is_online[2])
+    result += "style=\"background-color:green\"";
+  else
+    result += "style=\"background-color:red\"";
+  result += " maxlength=\"15\"><br>\r\n";
+  result += "<input type=\"Submit\" name=\"send\" value=\"Save\"> \r\n";
+  result += "<input type=\"Submit\" name=\"send\" value=\"Refresh\">\r\n\r\n</form>\r\n";
+  result += "</body>\r\n</html>";
+  server.send(200, "text / html", result);
+}
+ 
+void handleDump() {
+  Serial.println("EEPROM:");
+  for (int i = 0; i < EEPROM_SIZE; i++) {
+    Serial.print(i);
+    Serial.print(": ");
+    Serial.println((char) EEPROM.read(i));
+  }
+  Serial.println("END");
+  server.send(200, "text / html", "DUMPED ON SERIAL OUTPUT");
+}
+ 
+ 
+void setup() {
+  // Initialize Serial and LEDs
+  Serial.begin(115200);
+  delay(20);
+  Serial.println("\r\n Ready ");
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, HIGH);
+ 
+  // Read IPs and Wifi-credentials from EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+ 
+  if (RESET_EEPROM) { // First start, initialize EEPROM
+    strncpy(host1, "192.168.0.1", 11);
+    strncpy(host2, "0.0.0.0", 7);
+    strncpy(host3, "0.0.0.0", 7);
+ 
+    writeSSIDtoEEPROM(WIFI_SSID);
+    writePASSWORDtoEEPROM(WIFI_PASSWORD);
+    writeIPtoEEPROM();
+ 
+    Serial.println("EEPROM initialized");
+    while (true)
+    {
+      digitalWrite(PIN_LED, HIGH);
+      delay(100);
+      digitalWrite(PIN_LED, LOW);
+      delay(100);
+    }
+  } else {
+    // Read from EEPROM
+    for (int i = 0; i < 15; i++) {
+      host1[i] = EEPROM.read(ADDRESS_IP1 + i);
+      host2[i] = EEPROM.read(ADDRESS_IP2 + i);
+      host3[i] = EEPROM.read(ADDRESS_IP3 + i);
+    }
+    for (int i = 0; i < 30; i++) // SSID
+      network_ssid[i] = EEPROM.read(ADDRESS_SSID + i);
+    for (int i = 0; i < 30; i++) // Password
+      network_password[i] = EEPROM.read(ADDRESS_PASSWORD + i);
+  }
+ 
+  // Print hosts
+  Serial.println("Hosts from EEPROM:");
+  Serial.print("[1]: ");
+  Serial.println(host1);
+  Serial.print("[2]: ");
+  Serial.println(host2);
+  Serial.print("[3]: ");
+  Serial.println(host3);
+  Serial.print("Wifi from EEPROM: \"");
+  Serial.print(network_ssid);
+  Serial.print("\" \"");
+  Serial.print(network_password);
+  Serial.println("\"\r\n");
+ 
+  // Connect to AP
+  WiFi.mode(WIFI_STA); // Set to client
+  WiFi.begin(network_ssid, network_password);
+ 
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.println(".");
+    if (state_LED == HIGH)
+      state_LED = LOW;
+    else
+      state_LED = HIGH;
+    digitalWrite(PIN_LED, state_LED);
+  }
+ 
+  Serial.print("Connected to ");
+  Serial.println(network_ssid);
+  Serial.print("IP address: ");
+  network_ip = WiFi.localIP();
+  Serial.println(network_ip);
+ 
+  // Start the server
+  server.on("/", handleRoot);
+  server.on("/dump/", handleDump);
+  server.begin();
+ 
+  digitalWrite(PIN_LED, HIGH);
+  delay(250);
+  digitalWrite(PIN_LED, LOW);
+}
+ 
+void loop() {
+  server.handleClient();
+  currentMillis = millis(); // Read current runtime
+ 
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Not connected anymore, restarting");
+    system_restart();
+  }
+ 
+  if (last_ping + PING_INTERVAL < currentMillis) {
+    Serial.print(currentMillis);
+    const char* host;
+ 
+    currentHost = (currentHost + 1) % count_hosts;
+    if (currentHost == 0)
+      host = host1;
+    else if (currentHost == 1)
+      host = host2;
+    else
+      host = host3;
+ 
+    uint32 address = ipaddr_addr(host);
+    if (host[0] == '0' && host[2] == '0' && host[4] == '0' && host[6] == '0')
+      Serial.println(": Skipping");
+    else {
+      Serial.print(": Pinging \"");
+      Serial.print(host);
+      Serial.print("\" - ");
+      ping(address);
+      last_ping = currentMillis;
+    }
+  }
+ 
+  if (last_seen_online + (count_hosts * PING_INTERVAL) > currentMillis)
+    state_LED = HIGH;
+  else
+    state_LED = LOW;
+ 
+  digitalWrite(PIN_LED, state_LED);
+}
